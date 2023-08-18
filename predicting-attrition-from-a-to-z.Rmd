@@ -1,0 +1,977 @@
+---
+title: "IBM HR Analysis"
+author: "Ran Kirsh"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    number_sections: FALSE
+    toc: true
+    fig_width: 7
+    fig_height: 4.5
+    highlight: tango
+    code_folding: hide
+  pdf_document:
+    toc: true
+    toc_depth: 2
+    fig_width: 7
+    fig_height: 4.5
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(tidymodels)
+library(scales)
+library(janitor)
+library(gridExtra)
+library(glue)
+library(ggcorrplot)
+library(vip)
+knitr::opts_chunk$set(warning = FALSE)
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_chunk$set(message = FALSE)
+options(scipen = 999)
+theme_set(theme_bw())
+```
+
+
+# Intro
+
+<h2> to do </h2>
+
+This analysis will take have **two parts**:
+
+1. Explore the different variables and find relationships with target variable **attrition**
+2. Train different predictive models and evalutate model preformance
+
+***
+
+## Loading data and initial look
+
+```{r load data}
+hr <- read_csv("../input/ibm-hr-analytics-attrition-dataset/WA_Fn-UseC_-HR-Employee-Attrition.csv") %>% clean_names()
+
+glimpse(hr)
+
+paste0("There are ",sum(is.na(hr)), " missing values in the dataset")
+
+```
+
+***
+
+- The dataset contains 1470 observations and 35 variables.
+
+- There are no missing values.
+
+- Variables type:
+  - **Numeric variables**: 
+    - Related to personal information: age, distance_from_home, employee_number (id variable)
+    - Related to income: hourly_rate, daily_rate, monthly_rate, monthly_income, percent_salary_hike
+    - Related to time in company: years_at_company, years_in_current_role, years_since_last_promotion, years_with_curr_manager, total_working_years
+    - other: num_companies_worked, standard_hours(to delete), training_times_last_year, employee_count (to delete)
+  - **Categorical variables**: 
+    - **Binary variables**: attrition(target variable),
+    gender, over18 (to delete),
+    over_time
+    - **Nominal variables**: department, education_field, job_role, marital_status
+    - **Ordinal variables**: 
+      - Ordinal regarding satisfaction and performance : environment_satisfaction, job_satisfaction, relationship_satisfaction, work_life_balance,job_involvement,performance_rating
+      - Other ordinal: business_travel, education, job_level, stock_option_level
+
+## Preprocessing
+
+We have some preprocessing to do:
+
+- Transform some of the binary variables into a 1/0 format.
+- Reclassify some variables into factors.
+- Remove unneeded features (employee_count, standart_hours and over18 have the same value for all observations).
+- Devide the data into a testing and training sets.
+
+```{r data_preprocessing, echo=TRUE}
+
+hr <-
+  hr %>%
+  mutate(across(c(attrition,over18,over_time),
+               ~ if_else(. == "Yes",1,0))) %>% 
+  mutate(across(c(attrition,over18,over_time),
+               ~ as.factor(.))) %>% 
+  mutate(attrition = fct_relevel(attrition,c("1","0"))) %>%
+  # Binary categorical
+  mutate(across(c(department, education_field,
+                  job_role, marital_status),~ as.factor(.))) %>%
+   # Nominal categorical
+  mutate(across(c(environment_satisfaction, job_satisfaction,
+                  relationship_satisfaction,
+                  work_life_balance,business_travel, education ,
+                  job_involvement,job_level, stock_option_level,
+                  performance_rating),
+                ~as.ordered(.))) %>%
+   # Ordinal categorical
+  mutate(business_travel = factor(business_travel, ordered = TRUE,
+                                  levels = c("Non-Travel",
+                                             "Travel_Rarely","Travel_Frequently"))) %>%
+  # Reordering
+  select(-employee_count,-standard_hours,-over18)
+  # Removing non pertinant variables
+
+
+# Dividing features into vectors to faciltate plotting
+numerical <- c("age", "distance_from_home","hourly_rate",
+               "daily_rate", "monthly_rate","monthly_income",
+               "percent_salary_hike","years_at_company",
+               "years_in_current_role","years_since_last_promotion",
+               "years_with_curr_manager","total_working_years",
+               "num_companies_worked","training_times_last_year") 
+
+categorical <- c("gender","over_time","department",
+                 "education_field", "job_role", "marital_status")
+
+ordinal <- c("environment_satisfaction", "job_satisfaction",
+             "relationship_satisfaction","work_life_balance",
+             "job_involvement","performance_rating",
+             "business_travel", "education","job_level",
+             "stock_option_level")
+
+# Creating a train/test split
+set.seed(1234)
+spl <- initial_split(data = hr, strata = attrition, prop = 0.8)
+train <- training(spl)
+test <- testing(spl)
+```
+
+***
+
+# Part one: Exploratory data analysis
+
+
+
+The first thing to do is to see what is the attrition rate.
+
+```{r}
+# Creating a summarizing function 
+summarise_att <- function(tbl) {
+  tbl %>%
+    summarise(att = sum(attrition == 1),
+              n = n(),
+              low = qbeta(0.025,att + 0.5,n - att + 0.5),
+              high = qbeta(0.975,att + 0.5,n - att + 0.5)) %>% 
+              mutate(pct_att = att/n)
+}
+
+train %>%
+  group_by(attrition) %>%
+  summarise_att() %>%
+  ggplot(aes(x = "",y = n,fill = attrition)) +
+  geom_bar(width = 1,stat = "identity") +
+  coord_polar(theta = "y") +
+  geom_text(aes(label = paste0(round(n/sum(n),3)*100,"%")),
+            position = position_stack(vjust = 0.5)) +
+  theme_minimal()+
+  theme(axis.title.x = element_blank(), axis.title.y = element_blank(),
+        panel.border = element_blank(),panel.grid=element_blank(),
+        axis.ticks = element_blank(),
+        plot.title=element_text(size=14, face="bold")) +
+  labs(title = "189 out of 1175 workers churned" )
+```
+
+
+The next thing we should do is look at all the different features and try to classify them into pertinant and non pertitant.
+
+***
+
+## Exploring numerical features
+
+For every numerical feature ill plot a stacked histogram and a density plot. With these plots we can assess if the different features have a statisticly significant effect on employee churn.
+
+```{r}
+# Preparing a summarizing function
+
+
+
+
+plot_histogram <- function(df,var1,var2) {
+  # From object to string: deparse(substitute(varname))
+  var1name <- as.name(var1)
+  df %>%
+    ggplot(aes(x = {{var1name}},fill = {{var2}})) + 
+    geom_histogram(alpha = 0.75,position = "stack",color = "black",bins = 30) +
+    geom_vline(aes(xintercept = median({{var1name}})), linetype = 2,size = 1) +
+    labs(caption = paste0("Median ", {{var1}},
+                          " is ",round(median({{df}}[[{{var1}}]]),2)),
+         y = element_blank(), x = element_blank(),
+         title = paste0({{var1}})) +
+    theme(legend.position = "none")
+}
+
+plot_density <- function(df,var1,var2){
+  var1name <- as.name(var1)
+  df %>%
+    ggplot(aes(x = {{var1name}},fill = {{var2}})) + 
+    geom_density(alpha = 0.5,color = "black") +
+    geom_vline(data = df %>%
+                 group_by({{var2}}) %>%
+                 summarize(mean.grp = mean({{var1name}})),
+               aes(xintercept = mean.grp,color = attrition),
+               linetype = "dashed",size = 1) +
+    labs(caption = paste0("Lines represent average by group"),
+         y = element_blank(), x = element_blank(), title = "")
+    #theme(axis.ticks.y = element_blank(),axis.text.y = element_blank())
+}
+
+plot_numerical <- function(df,var1,var2) {
+  p1 <- plot_histogram({{df}},{{var1}},{{var2}})
+  p2 <- plot_density({{df}},{{var1}},{{var2}})
+  
+  grid.arrange(p1,p2,ncol =2)
+  
+}
+```
+
+### Numeric related to personal information
+
+```{r}
+plot_numerical(train,numerical[1],attrition)
+plot_numerical(train,numerical[2],attrition)
+```
+
+- Age is distributed quite normally and workers who churn are younger.
+- Most workers are not working closer to home and it seems as though working further from home slightly increases the churn rate. 
+
+***
+
+### Numeric related to income
+
+```{r}
+# Plotting rate features
+plot_numerical(train,numerical[3],attrition)
+plot_numerical(train,numerical[4],attrition)
+plot_numerical(train,numerical[5],attrition)
+
+# Plotting monthly income
+plot_numerical(train,numerical[6],attrition)
+
+#Plotting precent hike
+plot_numerical(train,numerical[7],attrition)
+```
+
+- **hourly_rate**, **daily_rate** and **monthly_rate** are all quite uniformly with a platykurtic kurtosis (around -1.2). Also, the different rates do not seem to play a role in determening churn.
+
+- **monthly_income** is, as expected, skewed to the right and higher income, as expected, again, seems to negativly affect the attrition rate.
+
+- **percent_salary_hike** does not seem to affect the churn rate.
+
+***
+
+### Numeric related to time in company
+
+```{r}
+
+# Plotting features related to time in the company
+plot_numerical(train,numerical[8],attrition)
+plot_numerical(train,numerical[9],attrition)
+plot_numerical(train,numerical[10],attrition)
+plot_numerical(train,numerical[11],attrition)
+plot_numerical(train,numerical[12],attrition)
+
+```
+
+- **years_at_company**, **years_in_current_role**, **years_since_last_promotion**, **years_with_curr_manager** and **total_working_years** are all skewed to the right.
+- In general, as working time inceases, the chrun rate decreases. The effect is smaller when measuring time since promotion.
+- A feature engineering idea: see if its possible to combine **total_working_years** and **age** (or to drop one of them as they should be highly correlated)
+
+***
+
+### Other numeric
+
+```{r}
+plot_numerical(train,numerical[13],attrition)
+plot_numerical(train,numerical[14],attrition)
+```
+
+- **num_companies_worked** and **training_time_last_year** have values ranging from 0 to 9 (respectively 0 to 6), both seem to not have a significant effect on the churn rate.
+
+***
+
+### Checking for correations between numerical features
+
+It is important to check for possible correletions between numeric predictors. 
+
+```{r}
+ggcorrplot(cor(train %>%
+                     select(any_of(numerical)) %>%
+                     rename("dist" = "distance_from_home",
+                            "rate_h" = "hourly_rate",
+                            "rate_d" = "daily_rate",
+                            "rate_m" = "monthly_rate",
+                            "income" = "monthly_income",
+                            "raise_%" = "percent_salary_hike",
+                            "y_comp" = "years_at_company",
+                            "y_role" = "years_in_current_role",
+                            "y_promo" = "years_since_last_promotion",
+                            "y_w_boss" = "years_with_curr_manager",
+                            "work_y" = "total_working_years",
+                            "past_job" = "num_companies_worked",
+                            "train_time" = "training_times_last_year")),
+         method = 'square', type = 'lower',colors = c("#E46726", "white", "#6D9EC1"))
+
+
+```
+
+- In order to facilitate reading the plot i've shortented the names of all features.
+- The fact that we see a complete lack of correlation between some of the features in not by error or chance. As the database is made **artificially** it is possible to have an extremely low correlation between two varaibles that should be correlted when the data is gathered and not generated.
+- The variables that are problematic are: **distance_from_home**, **hourly_rate**, **daily_rate**, **monthly_rate**, **percent_salary_hike** and **training_times_last_year**.
+- To show the lack of correlation I created some scatter plots using these sex features.
+
+
+```{r}
+p1 <- train %>% ggplot(aes(daily_rate,monthly_rate)) + geom_point() +
+  geom_smooth(method = "lm",formula = y~x)
+p2 <- train %>% ggplot(aes(percent_salary_hike,distance_from_home)) + geom_point() +
+  geom_smooth(method = "lm",formula = y~x)
+p3 <- train %>% ggplot(aes(training_times_last_year,hourly_rate)) + geom_point() +
+  geom_smooth(method = "lm",formula = y~x)
+p4 <- train %>% ggplot(aes(distance_from_home,daily_rate)) + geom_point() + 
+  geom_smooth(method = "lm",formula = y~x)
+
+grid.arrange(p1,p2,p3,p4,ncol = 2)
+rm(p1,p2,p3,p4)
+```
+
+- As all six features do not seem to have any correlation with the target variable **and** seem to be randomly generated, I will not use them in the prediction stage.
+
+```{r}
+numerical_proper <- c("age","monthly_income",
+               "years_at_company", "years_in_current_role",
+               "years_since_last_promotion", "years_with_curr_manager",
+               "total_working_years","num_companies_worked")
+
+ggcorrplot(cor(train %>%
+                     select(any_of(numerical_proper)) %>%
+                     rename("income" = "monthly_income",
+                            "y_comp" = "years_at_company",
+                            "y_role" = "years_in_current_role",
+                            "y_promo" = "years_since_last_promotion",
+                            "y_w_boss" = "years_with_curr_manager",
+                            "work_y" = "total_working_years",
+                            "past_job" = "num_companies_worked")),
+         method = 'square', type = 'lower',lab = TRUE,
+         colors = c("#E46726", "white", "#6D9EC1"))
+
+```
+
+- The correlation plot without the randomaly generated variables shows strong possitive correlations between four paires of features:
+  1. **years_in_current_role** and **years_at_company**
+  2. **years_in_current_role** and **years_with_curr_manager**
+  3. **years_at_company** and **years_with_curr_manager**
+  4. **monthly_income and** **total_working_years**
+
+- For this reason we should consider dropping either **years_in_current_role**, **years_at_company** or **years_with_curr_manager** in the prediction stage.
+
+***
+
+## Exploring categorical features
+
+- Are married workers less likely to leave the company?
+- Do technicians leave the company at higher rates?
+
+We can now find out:
+
+### Binary and nominal categorical
+
+- For each of the binary and nominal categorical variable I will plot the attrition rate with it's respective confidance intervale and total group size in brackets.
+- We want to compare each group's rate to the total average (in the dotted line) to see if there is a noticable difference.
+
+```{r}
+# Creating a tie fighter plot function
+plot_tiefighter <- function(tbl,var1) 
+  {
+  var1name <- as.name(var1)
+  tbl %>%
+    group_by({{var1name}}) %>%
+    summarise_att() %>%
+    mutate({{var1name}} := glue("{pull(., {{var1}})}\n ({n})")) %>%
+    mutate({{var1name}} := fct_reorder({{var1name}},desc(pct_att))) %>%
+    ggplot(aes(x = {{var1name}}, y = pct_att)) + 
+    geom_point(size = 4,shape = 18,aes(color = {{var1name}})) +
+    geom_errorbar(aes(ymin = low,ymax = high,
+                      color = {{var1name}}),size = 1) +
+    theme(legend.position = "none") +
+    geom_hline(aes(yintercept = sum(att)/sum(n)),linetype = 3) +
+    scale_y_continuous(labels = label_percent()) +
+    labs(title =paste0("Attrition rate by ",{{var1name}}),
+         x = element_blank(),y = element_blank()) +
+    coord_flip()
+}
+# plotting
+plot_tiefighter(train,categorical[1])
+plot_tiefighter(train,categorical[2])
+
+
+```
+
+- There is no apparent **gender** difference regarding the attrition rate.
+- A worker doing **overtime** has a higher probabilty to leave the company.
+
+***
+
+```{r}
+plot_tiefighter(train,categorical[3])
+plot_tiefighter(train,categorical[4])
+plot_tiefighter(train,categorical[5])
+plot_tiefighter(train,categorical[6])
+```
+
+- The R&D **department** seems to have less attrition then the sales team. If we take in consideration the confidence interval, however this difference could be the result of chance.
+- **education_field** does not seem to significantly affect the attrition rate.
+- Directors, managers and heathcare representatives have a lower then average attrition rate, in contrast with lab techincians and sales representatives whose **job_roles** have a much higher attrition rate.
+- **marital_status** seems to be a pertinant feature in relation to attrition: singles have a higher then average attrition rate.
+
+***
+
+### Ordinal categorical
+
+- For the ordinal features we will create bar plots in conjunction with error bars.
+
+```{r}
+
+# Creating a bar and errorbar plot function
+plot_bar_error <- function(tbl,var1) 
+  {
+  var1name <- as.name(var1)
+  tbl %>%
+    group_by({{var1name}}) %>%
+    summarise_att() %>%
+    mutate({{var1name}} := glue("{pull(., {{var1}})}\n ({n})")) %>%
+    ggplot(aes(x = {{var1name}}, y = pct_att)) + 
+    geom_col(aes(fill = {{var1name}}),width = 0.75,color = "black") +
+    geom_errorbar(aes(ymin = low,ymax = high)
+                  ,size = 1,width = 0.3,color = "black",alpha = 0.75) +
+    geom_hline(aes(yintercept = sum(att)/sum(n)),linetype = 3) +
+    theme(legend.position = "none") +
+    scale_y_continuous(labels = label_percent()) +
+    labs(title =paste0("Attrition rate by ",{{var1name}}),
+         x = element_blank(),y = element_blank())
+}
+
+plot_bar_error(train,ordinal[1])
+plot_bar_error(train,ordinal[2])
+plot_bar_error(train,ordinal[3])
+plot_bar_error(train,ordinal[4])
+plot_bar_error(train,ordinal[5])
+
+
+```
+
+- Higher environment, job, relationship **satisfaction**, **work life balance** and **job involement** seems to translate into lower attrition.
+- The effect is similar with all five features: it is the most noticable in **job involement** and the least in relationship satisfaction.
+- As these five features are very similar in nature and in their effect on the target variable, I think we should combine them all into one feature and see the reasults.
+
+***
+
+#### Visualising total satisfaction
+
+```{r}
+train <- 
+  train %>%
+  mutate(total_satisfaction =
+           as.numeric(environment_satisfaction) +
+           as.numeric(job_satisfaction) +
+           as.numeric(relationship_satisfaction) +
+           as.numeric(work_life_balance) +
+           as.numeric(job_involvement))
+
+train %>%
+  group_by(total_satisfaction) %>%
+  summarise_att() %>%
+  ggplot(aes(x = as.factor(total_satisfaction), y = pct_att)) + 
+  geom_col(aes(fill = as.factor(total_satisfaction)),
+           width = 0.75,color = "black") +
+  geom_errorbar(aes(ymin = low,ymax = high),
+                size = 1,width = 0.3,color = "black",alpha = 0.75) +
+  geom_hline(aes(yintercept = sum(att)/sum(n)),linetype = 3) +
+  theme(legend.position = "none") +
+  scale_y_continuous(labels = label_percent()) +
+  labs(title ="Attrition rate by total_satisfaction",
+       x = element_blank(),y = element_blank()) +
+  scale_x_discrete(labels = 
+                     train %>%
+                     group_by(total_satisfaction) %>%
+                     summarise_att() %>%
+                     mutate(total_satisfaction = paste0(total_satisfaction,
+                                                        "\n (",n,")")) %>%
+                     pull(total_satisfaction))
+```
+
+- We can see a consistant drop in the attrition rate as the total satisfaction score increases.
+
+- As this feature is pertinant and insightful, I will use it when predicting **attrition**.
+
+***
+
+```{r}
+plot_bar_error(train,ordinal[6])
+
+# As the glue package messes up the order of levels in business travel ill plot it without using the user defined function
+train %>%
+  group_by(business_travel) %>%
+  summarise_att() %>%
+  ggplot(aes(x = business_travel, y = pct_att)) +
+  geom_col(aes(fill = business_travel),width = 0.75,color = "black") +
+  geom_errorbar(aes(ymin = low,ymax = high),size = 1,width = 0.3,color = "black") +
+  geom_hline(aes(yintercept = sum(att)/sum(n)),linetype = 3) +
+  theme(legend.position = "none") +
+  scale_y_continuous(labels = label_percent()) +
+  labs(title =paste0("Attrition rate by business_travel"),
+       x = element_blank(),y = element_blank()) +
+  scale_x_discrete(labels = train %>%
+  group_by(business_travel) %>%
+  summarise_att() %>%
+  mutate(business_travel = paste0(business_travel,"\n (",n,")")) %>%
+           pull(business_travel)) +
+  scale_fill_manual(values = c("#F8766D", "#00BA38", "#619CFF"))
+
+plot_bar_error(train,ordinal[8])
+plot_bar_error(train,ordinal[9])
+plot_bar_error(train,ordinal[10])
+```
+
+
+- **rating evaluation** does not seem to be a perninat feature in determining attrition.
+- Worker who frequently **travel for business** have a much higher attrition rate the those who do not travel for work at all.
+- The level of **education** does not seems to affect attrition.
+- **Job level**, however seems to be an imporatant feature: workers with job level 1 are churning in a higher rate while those with job level 2,4 and 5 churn less then average
+- Those who set their **stock option level** to 0 churn at a higher rate then the rest
+
+***
+
+## Post EDA conclusions
+
+
+- We found several features that have a visible effect on the target variable:
+ - **age**, **total_working_years**, **years_at_company**, **years_in_current_role** and **monthly_income** -numerical
+ - **over_time**, **marital_status** and **job_role** - nominal categorical
+ - **business_travel**, **job_level** and **stock_option_level** - ordinal categical
+ 
+- We combined a few features to create **total_satisfaction** which is correlated to **attrition_rate**. We can also use this variable in the prediction stage and drop the five satisfaction questions.
+
+- We discovered 6 numerical variables which are randomly genrated non pertitant.
+- We found some highly correlated predictors, in order to reduce multicollinearity we will also drop **years_at_company**.
+
+- The profile of a worker which is the most like to churn:
+  1. Young
+  2. Low salary
+  3. Working overtime
+  4. Single
+  5. Working as a sales rep or a lab tech
+  6. Has a low overall satisfaction level
+  7. Travels frequently
+  8. Has stock level set to 0
+  
+
+
+```{r}
+post_eda_processing <- function(tbl) {
+  tbl %>%
+    mutate(total_satisfaction =
+           as.numeric(environment_satisfaction) +
+           as.numeric(job_satisfaction) +
+           as.numeric(relationship_satisfaction) +
+           as.numeric(work_life_balance) +
+           as.numeric(job_involvement)) %>%
+  # Creating feature
+    #select(-c(environment_satisfaction,job_satisfaction,relationship_satisfaction,
+    #          work_life_balance,job_involvement)) %>%
+  # Removing components of total_satisfaction
+    select(-c(distance_from_home,hourly_rate,daily_rate,monthly_rate,percent_salary_hike,
+              training_times_last_year)) %>%
+  # Removing randomly generated features
+    select(-c(years_at_company))# %>%
+  # Reducing colliniarity
+  #  mutate(attrition = fct_rev(attrition))
+  # Reversing the order of levels to predict churn and not stay
+  
+  
+}
+
+hr <- post_eda_processing(hr)
+train <- post_eda_processing(train)
+test <- post_eda_processing(test)
+
+```
+
+
+# Part two: Predicting attrition
+
+- We explored the data, we showed how the different predictors interact with **attrition**, now it is time to build predictive models.
+
+
+## Model preprocessing
+
+- As we will be using the **tidymodels** framework in the prediction stage, we will need to create a recipe to then add it to different models.
+- The formula will be **predict attrition using all variables**
+- I will also add some preprocessing steps:
+  1. **update** the role of employee_number to ID so it would not be taked into account
+  2. **normalize** some of the numerical values
+  3. transorm all categorical features into **dummy** variables: having either 1 or 0 as value
+  4. remove features with **near zero variance**
+  5. remove features with high correlation to other features
+
+```{r}
+
+hr_recipe <- recipe(data = train,formula = attrition ~ .) %>%
+  update_role(employee_number, new_role = "ID") %>%
+  step_normalize(any_of(c("age","monthly_income","total_satisfaction"))) %>%
+  step_dummy(all_nominal_predictors(),one_hot = TRUE) %>%
+  step_nzv(all_nominal_predictors()) %>%
+  step_corr(all_predictors())
+
+
+hr_recipe %>% prep() %>% juice() %>% glimpse()
+
+```
+
+- The data is now preped and ready for fitting
+
+***
+
+## Logistic regression
+
+<h2> to do </h2>
+
+### LR with all features
+
+At first I will fit a logistic model using **all** the predictors
+
+```{r}
+
+glm_spec <- 
+  logistic_reg() %>%
+  set_engine("glm") %>%
+  set_mode("classification")
+
+glm_model <- 
+  workflow() %>% 
+  add_recipe(hr_recipe) %>% 
+  add_model(glm_spec) %>%
+  fit(data =  train)
+
+glm_model %>% tidy() %>%
+  arrange(estimate) %>%
+  filter(p.value <= 0.05) %>%
+  mutate(term = fct_reorder(term,-estimate),
+         condition = if_else(estimate >=0,FALSE,TRUE)) %>%
+  ggplot(aes(x = term, y = estimate,fill = condition )) +
+  geom_col(width = 0.8,color = "black",alpha = 0.75) + 
+  geom_errorbar(aes(ymin = estimate - std.error * 1.96,
+                    ymax = estimate + std.error * 1.96),
+                width = 0.5, alpha = 0.5) +
+  theme(legend.position = "none", axis.ticks.x = element_blank(),
+        axis.text.x = element_blank()) +
+  coord_flip() +
+  labs(title = "Statisticly significant features (p.value < 0.05)",
+       subtitle = "bars going to the left: less chance to churn",
+       x = element_blank(), y = element_blank())
+
+```
+
+***
+
+We fit the logistic regression on the training data.
+Now we should fit the model on the **testing data** in order to see how it preforms on unseen data.
+
+```{r}
+glm_pred <-
+  bind_cols(
+    test["attrition"],
+    predict(glm_model,test),
+    predict(glm_model,test,type = "prob"))
+
+
+glm_pred %>% 
+  conf_mat(attrition, .pred_class) %>%
+  autoplot(type = "heatmap")
+
+roc_curve(glm_pred, truth = attrition, estimate = .pred_1) %>% autoplot()
+
+
+metric_df <-
+  bind_rows(
+    accuracy(glm_pred,attrition,.pred_class),
+    roc_auc(glm_pred,attrition,.pred_1)) %>%
+  mutate(model = "LR1")
+
+ metric_df
+```
+
+Our inital model has an **accuracy** score of 0.874 and and **roc_auc** score of 0.863
+
+***
+
+### LR with feature selection
+
+We know how a logistic regression model with all predictors preforms, we should compare its preformance to a logistic model with only **pertinant features** taken in consideration.
+
+
+
+```{r}
+hr_recipe2 <- 
+  recipe(data = train,formula = attrition ~ age + total_working_years + monthly_income +
+           over_time + marital_status + job_role + business_travel + job_level +
+           stock_option_level + total_satisfaction + years_with_curr_manager) %>%
+  step_normalize(any_of(c("age","monthly_income","total_satisfaction"))) %>%
+  step_dummy(all_nominal_predictors(),one_hot = TRUE) %>%
+  step_nzv(all_nominal_predictors()) %>%
+  step_corr(all_predictors())
+
+
+
+glm_model2 <- 
+  workflow() %>% 
+  add_recipe(hr_recipe2) %>% 
+  add_model(glm_spec) %>%
+  fit(data =  train)
+
+
+glm_pred <-
+  bind_cols(
+    test["attrition"],
+    predict(glm_model2,test),
+    predict(glm_model2,test,type = "prob"))
+
+glm_pred %>% 
+  conf_mat(attrition, .pred_class) %>%
+  autoplot(type = "heatmap")
+
+
+metric_df <-
+  bind_rows(bind_rows(
+    accuracy(glm_pred,attrition,.pred_class),
+    roc_auc(glm_pred,attrition,.pred_1)) %>%
+  mutate(model = "LR2"),
+  metric_df)
+
+
+metric_df %>% filter(model == "LR2")
+```
+
+When using only pertinant features, the **accuracy** and **roc_auc** drops
+
+***
+
+### Penalized regression
+
+- Let's see if a lasso model outpreforms the regular logistic regression model
+
+
+```{r}
+# Creating folds for cross validation
+train_fold <- train %>% vfold_cv(5,strata = attrition)
+
+# Declaring the model we will use
+lasso_spec <- logistic_reg(penalty = tune()) %>%
+  set_mode("classification") %>%
+  set_engine("glmnet")
+
+lasso_model <- 
+  workflow() %>%
+  add_recipe(hr_recipe) %>%
+  add_model(lasso_spec)
+
+# Creating the specification for our tune grid
+lambda_grid <- crossing(penalty = 10 ^ seq(-7,-0.5,0.1))
+
+lasso_grid <- tune_grid(lasso_model
+                        ,resamples = train_fold,
+                        grid = lambda_grid)
+
+highest_acc <- lasso_grid %>% 
+  select_best("accuracy",maximise = TRUE)
+
+lasso_grid %>% autoplot()
+
+```
+
+We correctly identified the best preforming penalty parameter, we can fit the model to the training data
+
+***
+
+```{r}
+
+# Applying the tuning to our workflow
+lasso_model <- finalize_workflow(lasso_model,
+                  highest_acc) %>% fit(data = train)
+
+lasso_model %>%
+  pull_workflow_fit() %>%
+  vi(lambda = highest_acc$penalty) %>%
+  mutate(Importance = abs(Importance),
+         Variable = fct_reorder(Variable, Importance),
+         Sign = fct_rev(Sign)) %>%
+  top_n(15,wt = Importance) %>% 
+  ggplot(aes(x = Importance, y = Variable, fill = Sign)) +
+  geom_col(color = "black", width = 0.8, alpha = 0.75) +
+  theme(legend.position = "none", axis.ticks.x = element_blank(),
+        axis.text.x = element_blank()) +
+   labs(title = "Most important features",subtitle = "Red bars: more chance to churn", y = element_blank()) 
+```
+
+The model is properly fit and it's time to use the model to predict attrition.
+
+```{r}
+lasso_pred <-
+  bind_cols(
+    test["attrition"],
+    predict(lasso_model,test),
+    predict(lasso_model,test,type = "prob"))
+
+
+
+
+lasso_pred %>% 
+  conf_mat(attrition, .pred_class) %>%
+  autoplot(type = "heatmap")
+
+roc_curve(lasso_pred, truth = attrition, estimate = .pred_1) %>% autoplot()
+
+
+metric_df <-
+  bind_rows(bind_rows(
+    accuracy(lasso_pred,attrition,.pred_class),
+    roc_auc(lasso_pred,attrition,.pred_1)) %>%
+  mutate(model = "Lasso"),
+  metric_df)
+
+metric_df %>% filter(model == "Lasso")
+```
+
+- Using penelized regression, the **accuracy** score is 0.8745 and the **roc_auc** score is  0.872
+
+## Random forest
+
+Now let's build and tune a random forest model
+
+```{r}
+rf_spec <- rand_forest(
+  mtry = tune(),
+  trees = tune(),
+  min_n = tune()) %>%
+  set_mode("classification") %>% 
+  set_engine(engine = "ranger")
+
+
+rf_grid <-
+  crossing(mtry = c(9:17),min_n = c(seq(1,25,5)),trees = c(500))
+
+
+rf_model <- 
+  workflow() %>%
+  add_recipe(hr_recipe) %>%
+  add_model(rf_spec)
+
+
+rf_tune <- tune_grid(rf_model,
+          resamples = train_fold,
+          grid = rf_grid
+          )
+highest_acc <- rf_tune %>% select_best("accuracy")
+
+rf_tune %>% autoplot()
+rf_tune %>% collect_metrics() %>% arrange(-mean)
+```
+
+- **Tune log**
+  1. Tuned trees, min_n and mtry: 
+    - accuracy and roc_auc fall when min_n > 10 
+    - one predictors is too low
+    - number of trees do not significantly change metrics
+  2. Tuned trees, min_n and mtry:
+    - the model seems better with more randomly assigned predictors
+    - 500 trees some to be better with most combinations
+    - for better accuracy we should go for higher then 5 predictors
+  3. Tuned trees, min_n and mtry:
+    - 500 trees is definitely better then 750: **500 trees chosen**
+    - the accuracy score improves with number of predictors, roc_auc is more volatile.
+  4. Tuned min_n and mtry, trees = 500:
+    - accracy and roc score drops quite consistantly when min_n > 25
+  5. We select the models that has the best **accuracy** score.
+
+
+***
+
+Now lets fit the model on the training and predict **attrition** from the testing set
+
+```{r}
+rf_model <- finalize_workflow(rf_model,
+                  highest_acc) %>% fit(data = train)
+
+rf_model %>%
+  pull_workflow_fit()
+
+rf_pred <-
+  bind_cols(
+    test["attrition"],
+    predict(rf_model,test),
+    predict(rf_model,test,type = "prob"))
+
+rf_pred %>% 
+  conf_mat(attrition, .pred_class) %>%
+  autoplot(type = "heatmap")
+
+roc_curve(rf_pred, truth = attrition, estimate = .pred_1) %>% autoplot()
+
+metric_df <-
+  bind_rows(bind_rows(
+    accuracy(rf_pred,attrition,.pred_class),
+    roc_auc(rf_pred,attrition,.pred_1)) %>%
+  mutate(model = "RF"),
+  metric_df)
+
+metric_df %>% filter(model == "RF")
+
+```
+
+***
+
+## Model evaluation
+
+```{r}
+metric_df %>%
+  ggplot(aes(x = model, y = .estimate,fill = model)) +
+  geom_col(width = 0.8, alpha = 0.75,color = "black") +
+  labs(title = "Model evaluation",y = NULL, x = NULL) + 
+  facet_wrap(~ .metric) +
+  scale_y_continuous(limits = c(0.5,1),oob = rescale_none) +
+  geom_text(aes(label = round(.estimate,3)),vjust = 2)
+```
+
+- The lasso model and the first logistic regression model have the best **accuracy** score
+- The logistic regression model, however, has the lowest **roc_auc** score
+- The random forest model is a little less accurate then the rest and has a significatly lower **roc_auc** score
+
+- For these reasons the **lasso model will be chosen**
+
+***
+
+# Ending notes
+
+- I quite enjoyed doing this analysis even though I discovered mid-analysis that the data was crated artifitially
+- I feel like I start to better understand how to use the **tidymodels** framework
+- Same can be said on plotting techniques and on commenting along my work 
+- During the time I was preparing this I made a small list of notions of statistics and r programming that helped me when I things were unclear, you can find in in the next section
+
+***
+
+## Things I learned prepering this analysis
+
+- The basics of using the janitor package [(link)](https://garthtarr.github.io/meatR/janitor.html).
+- Basics of the beta distribution [(link)](https://stats.stackexchange.com/questions/47771/what-is-the-intuition-behind-beta-distribution)
+- Using the "[[]]" operator to extract content from a list [(link)](https://bookdown.org/rdpeng/rprogdatascience/subsetting-r-objects.html)
+- Using ggcorrplot to create a nice looking correlation plot [(link)](http://www.sthda.com/english/wiki/ggcorrplot-visualization-of-a-correlation-matrix-using-ggplot2)
+- Creating a summarizing function and many visualisation techniques [(video)](https://www.youtube.com/watch?v=Ep8OGhrSAhU&ab_channel=DavidRobinson)
+- Why we do data exploration on the training set [(link)](https://stats.stackexchange.com/questions/189678/is-it-better-to-do-exploratory-data-analysis-on-the-training-dataset-only)
+- Using the glue function in a user defined function [(link)](https://stackoverflow.com/questions/68623850/mutate-using-glue-in-a-user-defined-function)
+
+***
+
+<h1> Thank you for reading </h1>
